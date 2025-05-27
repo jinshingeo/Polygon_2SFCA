@@ -4,7 +4,7 @@ import osmnx as ox
 import time
 import numpy as np
 from tqdm import tqdm, trange
-from shapely.geometry import Point, MultiPoint
+from shapely.geometry import Point, MultiPoint, Polygon
 import networkx as nx
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
@@ -170,3 +170,389 @@ def step2_E2SFCA(
         demand_.loc[z, 'access'] = total_sum
 
     return demand_
+
+########### 그리드를 고려한 면적 형태 접근성 분석 코드 #############
+
+def create_polygon_grid(polygon, grid_size=200):
+    """
+    폴리곤을 정규 격자로 분할하여 각 격자의 센트로이드를 반환
+    
+    Args:
+        polygon: shapely.geometry.Polygon 객체
+        grid_size: 격자 크기 (미터 단위)
+    
+    Returns:
+        list: 격자 센트로이드들의 Point 객체 리스트
+    """
+    from shapely.geometry import box, Point
+    import numpy as np
+    
+    # 폴리곤의 경계 좌표 획득
+    minx, miny, maxx, maxy = polygon.bounds
+    
+    # 격자 생성을 위한 좌표 배열
+    cols = list(np.arange(minx, maxx + grid_size, grid_size))
+    rows = list(np.arange(miny, maxy + grid_size, grid_size))
+    
+    grid_centroids = []
+    
+    for x in cols[:-1]:
+        for y in rows[:-1]:
+            # 격자 셀 생성
+            grid_cell = box(x, y, x + grid_size, y + grid_size)
+            
+            # 원본 폴리곤과 교차하는 격자만 선택
+            if polygon.intersects(grid_cell):
+                # 교차 영역의 센트로이드 계산
+                intersection = polygon.intersection(grid_cell)
+                if not intersection.is_empty:
+                    grid_centroids.append(intersection.centroid)
+    
+    return grid_centroids
+
+def nearest_osm_enhanced(network, gdf, grid_size=200):
+    """
+    개선된 nearest_osm 함수 - 폴리곤의 경우 격자 센트로이드 기반
+    """
+    for idx, row in tqdm(gdf.iterrows(), total=gdf.shape[0]):
+        if row.geometry.geom_type == 'Point':
+            nearest_osm = ox.distance.nearest_nodes(
+                network, X=row.geometry.x, Y=row.geometry.y
+            )
+            gdf.loc[idx, 'nearest_osm'] = [nearest_osm]  # 리스트로 저장
+            
+        elif row.geometry.geom_type in ['Polygon', 'MultiPolygon']:
+            # 격자 센트로이드들 생성
+            if row.geometry.geom_type == 'MultiPolygon':
+                # MultiPolygon의 경우 가장 큰 폴리곤 선택
+                polygon = max(row.geometry.geoms, key=lambda p: p.area)
+            else:
+                polygon = row.geometry
+            
+            grid_centroids = create_polygon_grid(polygon, grid_size)
+            
+            # 각 격자 센트로이드의 nearest_osm 계산
+            nearest_nodes = []
+            for centroid in grid_centroids:
+                nearest_node = ox.distance.nearest_nodes(
+                    network, X=centroid.x, Y=centroid.y
+                )
+                nearest_nodes.append(nearest_node)
+            
+            gdf.loc[idx, 'nearest_osm'] = nearest_nodes
+        else:
+            print(f"Unsupported geometry type: {row.geometry.geom_type}")
+            continue
+    
+    return gdf
+
+def step1_E2SFCA_enhanced(
+    weights: Dict[Union[float, int], Union[float, int]],
+    supply: gpd.GeoDataFrame,
+    supply_attr: str,
+    demand: gpd.GeoDataFrame,
+    demand_attr: str,
+    network: nx.MultiDiGraph,
+    accessibility_threshold: float = 0.3  # 격자 중 접근 가능한 비율 임계값
+):
+    """
+    비율을 고려한 격자 기반 E2SFCA 1단계 - 공급시설의 접근성 비율 계산
+    """
+    supply_ = supply.copy(deep=True)
+    supply_['ratio'] = 0
+    supply_['accessible_grid_ratio'] = 0  # 접근 가능한 격자 비율 추가
+    
+    for i in tqdm(range(supply_.shape[0])):
+        supply_nearest_nodes = supply_.loc[i, 'nearest_osm']
+        
+        # 폴리곤의 경우 (격자 센트로이드들이 리스트로 저장됨)
+        if isinstance(supply_nearest_nodes, list):
+            accessible_grids = 0
+            total_grids = len(supply_nearest_nodes)
+            total_demand = 0
+            
+            for supply_node in supply_nearest_nodes:
+                grid_demand = 0
+                prev_nodes = set()
+                
+                # 각 격자 센트로이드에서 도달 가능한 수요 계산
+                for time, weight in sorted(weights.items(), key=lambda x: x[0]):
+                    temp_nodes = nx.single_source_dijkstra_path_length(
+                        network, supply_node, cutoff=time, weight='time'
+                    ).keys()
+                    
+                    current_nodes = set(temp_nodes) - prev_nodes
+                    demand_sum = demand.loc[
+                        demand['nearest_osm'].isin(current_nodes), demand_attr
+                    ].sum() * weight
+                    
+                    grid_demand += demand_sum
+                    prev_nodes.update(temp_nodes)
+                
+                # 해당 격자가 수요에 접근 가능한지 확인
+                if grid_demand > 0:
+                    accessible_grids += 1
+                    total_demand += grid_demand
+            
+            # 접근 가능한 격자 비율 계산
+            accessible_ratio = accessible_grids / total_grids if total_grids > 0 else 0
+            supply_.loc[i, 'accessible_grid_ratio'] = accessible_ratio
+            
+            # 임계값 이상의 격자가 접근 가능한 경우에만 공급시설로 간주
+            if accessible_ratio >= accessibility_threshold:
+                supply_value = supply_.loc[i, supply_attr]
+                # 접근 가능한 격자 비율을 가중치로 적용
+                weighted_supply = supply_value * accessible_ratio
+                step1_ratio = (weighted_supply / total_demand) * 100000 if total_demand > 0 else 0
+                supply_.loc[i, 'ratio'] = step1_ratio
+            else:
+                supply_.loc[i, 'ratio'] = 0
+                
+        else:
+            # Point의 경우 기존 로직 유지
+            total_demand = 0
+            prev_nodes = set()
+            
+            for time, weight in sorted(weights.items(), key=lambda x: x[0]):
+                temp_nodes = nx.single_source_dijkstra_path_length(
+                    network, supply_nearest_nodes, cutoff=time, weight='time'
+                ).keys()
+                
+                current_nodes = set(temp_nodes) - prev_nodes
+                demand_sum = demand.loc[
+                    demand['nearest_osm'].isin(current_nodes), demand_attr
+                ].sum() * weight
+                
+                total_demand += demand_sum
+                prev_nodes.update(temp_nodes)
+            
+            supply_value = supply_.loc[i, supply_attr]
+            step1_ratio = (supply_value / total_demand) * 100000 if total_demand > 0 else 0
+            supply_.loc[i, 'ratio'] = step1_ratio
+            supply_.loc[i, 'accessible_grid_ratio'] = 1.0  # Point는 100% 접근 가능
+        
+    return supply_
+
+def step2_E2SFCA_enhanced(
+    weights: Dict[Union[float, int], Union[float, int]],
+    result_step1: pd.DataFrame,
+    demand: pd.DataFrame,
+    network: nx.Graph
+) -> pd.DataFrame:
+    """
+    비율을 고려한 격자 기반 E2SFCA 2단계 - 수요지점의 접근성 지수 계산
+    """
+    demand_ = demand.copy(deep=True)
+    demand_['access'] = 0
+    
+    for z in tqdm(range(demand_.shape[0]), desc="Processing demand points"):
+        total_sum = 0
+        prev_nodes = set()
+        
+        for time, weight in sorted(weights.items(), key=lambda x: x[0]):
+            temp_nodes = nx.single_source_dijkstra_path_length(
+                network,
+                source=demand_.loc[z, 'nearest_osm'],
+                cutoff=time,
+                weight='time'
+            ).keys()
+            
+            current_nodes = set(temp_nodes) - prev_nodes
+            
+            # 공급시설별 접근성 계산
+            for idx, supply_row in result_step1.iterrows():
+                supply_nearest_nodes = supply_row['nearest_osm']
+                supply_ratio = supply_row['ratio']
+                
+                if supply_ratio == 0:  # 접근 불가능한 공급시설 제외
+                    continue
+                    
+                if isinstance(supply_nearest_nodes, list):
+                    # 격자 센트로이드 중 현재 노드 집합과 교차하는 것이 있는지 확인
+                    accessible_grids = len([
+                        node for node in supply_nearest_nodes 
+                        if node in current_nodes
+                    ])
+                    
+                    if accessible_grids > 0:
+                        # 접근 가능한 격자 비율에 따라 접근성 조정
+                        grid_accessibility_factor = accessible_grids / len(supply_nearest_nodes)
+                        adjusted_ratio = supply_ratio * grid_accessibility_factor * weight
+                        total_sum += adjusted_ratio
+                else:
+                    # Point 공급시설의 경우
+                    if supply_nearest_nodes in current_nodes:
+                        total_sum += supply_ratio * weight
+            
+            prev_nodes.update(temp_nodes)
+        
+        demand_.loc[z, 'access'] = total_sum
+
+    return demand_
+
+def step1_E2SFCA_alternative(
+    weights: Dict[Union[float, int], Union[float, int]],
+    supply: gpd.GeoDataFrame,
+    supply_attr: str,
+    demand: gpd.GeoDataFrame,
+    demand_attr: str,
+    network: nx.MultiDiGraph
+) -> gpd.GeoDataFrame:
+    """
+    대체 1단계: 모든 격자 캐치먼트의 합집합 기반 수요 계산
+    """
+    supply_ = supply.copy(deep=True)
+    supply_['ratio'] = 0
+
+    for i in tqdm(range(supply_.shape[0])):
+        supply_nearest_nodes = supply_.loc[i, 'nearest_osm']
+        
+        if isinstance(supply_nearest_nodes, list):
+            # 모든 격자 캐치먼트의 합집합 계산
+            all_demand_nodes = set()
+            for supply_node in supply_nearest_nodes:
+                prev_nodes = set()
+                total_grid_demand = 0
+                
+                # 시간 계층별 누적 노드 수집
+                for time, _ in sorted(weights.items(), key=lambda x: x[0]):
+                    temp_nodes = nx.single_source_dijkstra_path_length(
+                        network, supply_node, cutoff=time, weight='time'
+                    ).keys()
+                    current_nodes = set(temp_nodes) - prev_nodes
+                    all_demand_nodes.update(current_nodes)
+                    prev_nodes.update(temp_nodes)
+            
+            # 고유 수요 노드 기반 총 수요량 계산
+            total_demand = demand.loc[
+                demand['nearest_osm'].isin(all_demand_nodes), demand_attr
+            ].sum()
+            
+            # 공급 비율 계산
+            if total_demand > 0:
+                supply_value = supply_.loc[i, supply_attr]
+                supply_.loc[i, 'ratio'] = (supply_value / total_demand) * 100000
+            else:
+                supply_.loc[i, 'ratio'] = 0
+                
+        else:
+            # 점형 시설은 기존 로직 유지
+            total_demand = 0
+            prev_nodes = set()
+            
+            for time, weight in sorted(weights.items(), key=lambda x: x[0]):
+                temp_nodes = nx.single_source_dijkstra_path_length(
+                    network, supply_nearest_nodes, cutoff=time, weight='time'
+                ).keys()
+                
+                current_nodes = set(temp_nodes) - prev_nodes
+                demand_sum = demand.loc[
+                    demand['nearest_osm'].isin(current_nodes), demand_attr
+                ].sum() * weight
+                
+                total_demand += demand_sum
+                prev_nodes.update(temp_nodes)
+            
+            if total_demand > 0:
+                supply_value = supply_.loc[i, supply_attr]
+                supply_.loc[i, 'ratio'] = (supply_value / total_demand) * 100000
+            else:
+                supply_.loc[i, 'ratio'] = 0
+
+    return supply_
+
+def step2_E2SFCA_alternative(
+    weights: Dict[Union[float, int], Union[float, int]],
+    result_step1: pd.DataFrame,
+    demand: pd.DataFrame,
+    network: nx.Graph
+) -> pd.DataFrame:
+    """
+    대체 2단계: 단일 격자 포함 시 전체 공급량 반영
+    """
+    demand_ = demand.copy(deep=True)
+    demand_['access'] = 0
+    
+    for z in tqdm(range(demand_.shape[0]), desc="Processing demand points"):
+        total_sum = 0
+        prev_nodes = set()
+        
+        for time, weight in sorted(weights.items(), key=lambda x: x[0]):
+            temp_nodes = nx.single_source_dijkstra_path_length(
+                network,
+                source=demand_.loc[z, 'nearest_osm'],
+                cutoff=time,
+                weight='time'
+            ).keys()
+            
+            current_nodes = set(temp_nodes) - prev_nodes
+            
+            # 공급시설 접근성 계산
+            for idx, supply_row in result_step1.iterrows():
+                supply_nearest_nodes = supply_row['nearest_osm']
+                supply_ratio = supply_row['ratio']
+                
+                if supply_ratio == 0:
+                    continue
+                    
+                # 폴리곤 시설: 단일 격자 포함 여부 확인
+                if isinstance(supply_nearest_nodes, list):
+                    if any(node in current_nodes for node in supply_nearest_nodes):
+                        total_sum += supply_ratio * weight
+                # 점형 시설: 기존 로직
+                else:
+                    if supply_nearest_nodes in current_nodes:
+                        total_sum += supply_ratio * weight
+            
+            prev_nodes.update(temp_nodes)
+        
+        demand_.loc[z, 'access'] = total_sum
+
+    return demand_
+
+################## 성능 최적화 방안 ##########################
+
+# 병렬 처리 적용 예시 (공급측만)
+
+from multiprocessing import Pool
+
+def process_supply(supply_data):
+    return nearest_osm_enhanced(network, supply_data)
+
+################## ADB 작업용 코드 ##########################
+def process_rwi_to_grid(
+    boundary_shp_path, 
+    input_rwi_path, 
+    output_path, 
+    utm_epsg_uzb=32641
+):
+    '''우즈백 상대적 부 지수 산출 코드 파이프라인'''
+    # 1. 격자 데이터 로드
+    grid_gdf = gpd.read_file(boundary_shp_path).to_crs(epsg=utm_epsg_uzb)
+    grid_gdf["grid_id"] = grid_gdf.index
+
+    # 2. RWI 포인트 데이터 로드 및 변환
+    rwi_df = pd.read_csv(input_rwi_path)
+    rwi_gdf = gpd.GeoDataFrame(
+        rwi_df,
+        geometry=gpd.points_from_xy(rwi_df.longitude, rwi_df.latitude),
+        crs="EPSG:4326"
+    ).to_crs(epsg=utm_epsg_uzb)
+
+    # 3. 공간 조인 및 격자별 평균 계산
+    joined_rwi = gpd.sjoin(rwi_gdf, grid_gdf, how="left", predicate="intersects")
+    rwi_grid = joined_rwi.groupby("index_right")["rwi"].mean().reset_index()
+
+    # 4. 결과 병합 및 결측값 처리
+    result = grid_gdf.merge(
+        rwi_grid,
+        left_on="grid_id",
+        right_on="index_right",
+        how="left"
+    )
+    result["rwi"] = result["rwi"].fillna(0)
+
+    # 5. 저장
+    result.to_file(output_path, driver="GeoJSON")
+    print(f"✅ 처리 완료: {output_path}")
+
