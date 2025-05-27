@@ -173,78 +173,200 @@ def step2_E2SFCA(
 
 ########### 그리드를 고려한 면적 형태 접근성 분석 코드 #############
 
-def create_polygon_grid(polygon, grid_size=200):
-    """
-    폴리곤을 정규 격자로 분할하여 각 격자의 센트로이드를 반환
+# def create_polygon_grid(polygon, grid_size=200):
+#     """
+#     폴리곤을 정규 격자로 분할하여 각 격자의 센트로이드를 반환
     
-    Args:
-        polygon: shapely.geometry.Polygon 객체
-        grid_size: 격자 크기 (미터 단위)
+#     Args:
+#         polygon: shapely.geometry.Polygon 객체
+#         grid_size: 격자 크기 (미터 단위)
     
-    Returns:
-        list: 격자 센트로이드들의 Point 객체 리스트
-    """
-    from shapely.geometry import box, Point
-    import numpy as np
+#     Returns:
+#         list: 격자 센트로이드들의 Point 객체 리스트
+#     """
+#     from shapely.geometry import box, Point
+#     import numpy as np
     
-    # 폴리곤의 경계 좌표 획득
+#     # 폴리곤의 경계 좌표 획득
+#     minx, miny, maxx, maxy = polygon.bounds
+    
+#     # 격자 생성을 위한 좌표 배열
+#     cols = list(np.arange(minx, maxx + grid_size, grid_size))
+#     rows = list(np.arange(miny, maxy + grid_size, grid_size))
+    
+#     grid_centroids = []
+    
+#     for x in cols[:-1]:
+#         for y in rows[:-1]:
+#             # 격자 셀 생성
+#             grid_cell = box(x, y, x + grid_size, y + grid_size)
+            
+#             # 원본 폴리곤과 교차하는 격자만 선택
+#             if polygon.intersects(grid_cell):
+#                 # 교차 영역의 센트로이드 계산
+#                 intersection = polygon.intersection(grid_cell)
+#                 if not intersection.is_empty:
+#                     grid_centroids.append(intersection.centroid)
+    
+#     return grid_centroids
+
+# create_polygon_grid 함수 수정
+from shapely.geometry import box
+def create_polygon_grid(polygon, grid_size):
+    """격자 생성 (미터 단위 좌표계 필수)"""
+    # 경계 계산
     minx, miny, maxx, maxy = polygon.bounds
     
-    # 격자 생성을 위한 좌표 배열
-    cols = list(np.arange(minx, maxx + grid_size, grid_size))
-    rows = list(np.arange(miny, maxy + grid_size, grid_size))
+    # 격자 좌표 배열 (미터 단위)
+    x_coords = np.arange(minx, maxx + grid_size, grid_size)
+    y_coords = np.arange(miny, maxy + grid_size, grid_size)
     
-    grid_centroids = []
-    
-    for x in cols[:-1]:
-        for y in rows[:-1]:
-            # 격자 셀 생성
-            grid_cell = box(x, y, x + grid_size, y + grid_size)
-            
-            # 원본 폴리곤과 교차하는 격자만 선택
-            if polygon.intersects(grid_cell):
-                # 교차 영역의 센트로이드 계산
-                intersection = polygon.intersection(grid_cell)
+    grids = []
+    for x in x_coords[:-1]:  # 마지막 격자 제외
+        for y in y_coords[:-1]:
+            cell = box(x, y, x+grid_size, y+grid_size)
+            if polygon.intersects(cell):
+                intersection = polygon.intersection(cell)
                 if not intersection.is_empty:
-                    grid_centroids.append(intersection.centroid)
+                    grids.append(intersection.centroid)
+    return grids
     
-    return grid_centroids
-
-def nearest_osm_enhanced(network, gdf, grid_size=200):
-    """
-    개선된 nearest_osm 함수 - 폴리곤의 경우 격자 센트로이드 기반
-    """
-    for idx, row in tqdm(gdf.iterrows(), total=gdf.shape[0]):
-        if row.geometry.geom_type == 'Point':
-            nearest_osm = ox.distance.nearest_nodes(
-                network, X=row.geometry.x, Y=row.geometry.y
-            )
-            gdf.loc[idx, 'nearest_osm'] = [nearest_osm]  # 리스트로 저장
-            
-        elif row.geometry.geom_type in ['Polygon', 'MultiPolygon']:
-            # 격자 센트로이드들 생성
-            if row.geometry.geom_type == 'MultiPolygon':
-                # MultiPolygon의 경우 가장 큰 폴리곤 선택
-                polygon = max(row.geometry.geoms, key=lambda p: p.area)
-            else:
-                polygon = row.geometry
-            
-            grid_centroids = create_polygon_grid(polygon, grid_size)
-            
-            # 각 격자 센트로이드의 nearest_osm 계산
-            nearest_nodes = []
-            for centroid in grid_centroids:
-                nearest_node = ox.distance.nearest_nodes(
-                    network, X=centroid.x, Y=centroid.y
-                )
-                nearest_nodes.append(nearest_node)
-            
-            gdf.loc[idx, 'nearest_osm'] = nearest_nodes
-        else:
-            print(f"Unsupported geometry type: {row.geometry.geom_type}")
+def explode_grids(gdf, grid_size):
+    """격자 분할 및 레코드 증식 (수정 버전)"""
+    exploded = []
+    for idx, row in gdf.iterrows():
+        geom = row.geometry
+        if geom.is_empty or not geom.is_valid:
             continue
+            
+        # 폴리곤 처리
+        if geom.geom_type in ['Polygon', 'MultiPolygon']:
+            if geom.geom_type == 'MultiPolygon':
+                for poly in geom.geoms:
+                    grids = create_polygon_grid(poly, grid_size)
+                    for pt in grids:
+                        new_row = row.copy()
+                        new_row.geometry = pt
+                        new_row['parent_id'] = idx  # parent_id 추가
+                        exploded.append(new_row)
+            else:
+                grids = create_polygon_grid(geom, grid_size)
+                for pt in grids:
+                    new_row = row.copy()
+                    new_row.geometry = pt
+                    new_row['parent_id'] = idx  # parent_id 추가
+                    exploded.append(new_row)
+        else:
+            # 점/선형 데이터 처리
+            new_row = row.copy()
+            new_row['parent_id'] = idx
+            exploded.append(new_row)
+    
+    return gpd.GeoDataFrame(exploded, crs=gdf.crs)
+
+# def nearest_osm_enhanced(network, gdf, grid_size=200):
+#     """
+#     개선된 nearest_osm 함수 - 폴리곤의 경우 격자 센트로이드 기반
+#     """
+#     for idx, row in tqdm(gdf.iterrows(), total=gdf.shape[0]):
+#         if row.geometry.geom_type == 'Point':
+#             nearest_osm = ox.distance.nearest_nodes(
+#                 network, X=row.geometry.x, Y=row.geometry.y
+#             )
+#             gdf.loc[idx, 'nearest_osm'] = [nearest_osm]  # 리스트로 저장
+            
+#         elif row.geometry.geom_type in ['Polygon', 'MultiPolygon']:
+#             # 격자 센트로이드들 생성
+#             if row.geometry.geom_type == 'MultiPolygon':
+#                 # MultiPolygon의 경우 가장 큰 폴리곤 선택
+#                 polygon = max(row.geometry.geoms, key=lambda p: p.area)
+#             else:
+#                 polygon = row.geometry
+            
+#             grid_centroids = create_polygon_grid(polygon, grid_size)
+            
+#             # 각 격자 센트로이드의 nearest_osm 계산
+#             nearest_nodes = []
+#             for centroid in grid_centroids:
+#                 nearest_node = ox.distance.nearest_nodes(
+#                     network, X=centroid.x, Y=centroid.y
+#                 )
+#                 nearest_nodes.append(nearest_node)
+            
+#             gdf.loc[idx, 'nearest_osm'] = nearest_nodes
+#         else:
+#             print(f"Unsupported geometry type: {row.geometry.geom_type}")
+#             continue
+    
+#     return gdf
+
+# def nearest_osm_enhanced(network, gdf, grid_size=200):
+#     gdf = gdf.copy()
+#     gdf['nearest_osm'] = [[] for _ in range(len(gdf))]  # 빈 리스트 초기화
+    
+#     for idx, row in tqdm(gdf.iterrows(), total=len(gdf)):
+#         geom = row.geometry
+        
+#         try:
+#             if geom.geom_type == 'Point':
+#                 nearest_node = ox.distance.nearest_nodes(
+#                     network, X=geom.x, Y=geom.y
+#                 )
+#                 gdf.at[idx, 'nearest_osm'] = [nearest_node]
+                
+#             elif geom.geom_type in ['Polygon', 'MultiPolygon']:
+#                 if geom.geom_type == 'MultiPolygon':
+#                     geom = max(geom.geoms, key=lambda p: p.area)
+#                 grid_centroids = create_polygon_grid(geom, grid_size)
+#                 nearest_nodes = [
+#                     ox.distance.nearest_nodes(network, X=pt.x, Y=pt.y)
+#                     for pt in grid_centroids
+#                 ]
+#                 gdf.at[idx, 'nearest_osm'] = nearest_nodes
+                
+#         except Exception as e:
+#             print(f"Error processing index {idx}: {str(e)}")
+#             gdf.at[idx, 'nearest_osm'] = []  # 빈 리스트로 설정
+            
+#     return gdf
+def nearest_osm_enhanced(network, gdf, grid_size=200):
+    gdf = gdf.copy()
+    
+    # 1단계: object 타입 초기화 (강제)
+    gdf['nearest_osm'] = gdf['nearest_osm'].astype('object')
+    
+    # 2단계: 빈 리스트로 초기화
+    gdf['nearest_osm'] = [[] for _ in range(len(gdf))]
+    
+    for idx, row in tqdm(gdf.iterrows(), total=len(gdf)):
+        geom = row.geometry
+        
+        try:
+            if geom.geom_type == 'Point':
+                nearest_node = ox.distance.nearest_nodes(network, geom.x, geom.y)
+                gdf.at[idx, 'nearest_osm'] = [nearest_node]  # 리스트 할당
+                
+            elif geom.geom_type in ['Polygon', 'MultiPolygon']:
+                if geom.geom_type == 'MultiPolygon':
+                    geom = max(geom.geoms, key=lambda p: p.area)
+                grid_centroids = create_polygon_grid(geom, grid_size)
+                nearest_nodes = [
+                    ox.distance.nearest_nodes(network, pt.x, pt.y)
+                    for pt in grid_centroids
+                ]
+                gdf.at[idx, 'nearest_osm'] = nearest_nodes  # 리스트 할당
+                
+        except Exception as e:
+            gdf.at[idx, 'nearest_osm'] = []  # 빈 리스트 유지
+            
+    # 3단계: 최종 타입 강제 지정
+    gdf['nearest_osm'] = gdf['nearest_osm'].astype('object')
     
     return gdf
+
+
+
+
 
 def step1_E2SFCA_enhanced(
     weights: Dict[Union[float, int], Union[float, int]],
@@ -390,6 +512,77 @@ def step2_E2SFCA_enhanced(
 
     return demand_
 
+# def step1_E2SFCA_alternative(
+#     weights: Dict[Union[float, int], Union[float, int]],
+#     supply: gpd.GeoDataFrame,
+#     supply_attr: str,
+#     demand: gpd.GeoDataFrame,
+#     demand_attr: str,
+#     network: nx.MultiDiGraph
+# ) -> gpd.GeoDataFrame:
+#     """
+#     대체 1단계: 모든 격자 캐치먼트의 합집합 기반 수요 계산
+#     """
+#     supply_ = supply.copy(deep=True)
+#     supply_['ratio'] = 0
+
+#     for i in tqdm(range(supply_.shape[0])):
+#         supply_nearest_nodes = supply_.loc[i, 'nearest_osm']
+        
+#         if isinstance(supply_nearest_nodes, list):
+#             # 모든 격자 캐치먼트의 합집합 계산
+#             all_demand_nodes = set()
+#             for supply_node in supply_nearest_nodes:
+#                 prev_nodes = set()
+#                 total_grid_demand = 0
+                
+#                 # 시간 계층별 누적 노드 수집
+#                 for time, _ in sorted(weights.items(), key=lambda x: x[0]):
+#                     temp_nodes = nx.single_source_dijkstra_path_length(
+#                         network, supply_node, cutoff=time, weight='time'
+#                     ).keys()
+#                     current_nodes = set(temp_nodes) - prev_nodes
+#                     all_demand_nodes.update(current_nodes)
+#                     prev_nodes.update(temp_nodes)
+            
+#             # 고유 수요 노드 기반 총 수요량 계산
+#             total_demand = demand.loc[
+#                 demand['nearest_osm'].isin(all_demand_nodes), demand_attr
+#             ].sum()
+            
+#             # 공급 비율 계산
+#             if total_demand > 0:
+#                 supply_value = supply_.loc[i, supply_attr]
+#                 supply_.loc[i, 'ratio'] = (supply_value / total_demand) * 100000
+#             else:
+#                 supply_.loc[i, 'ratio'] = 0
+                
+#         else:
+#             # 점형 시설은 기존 로직 유지
+#             total_demand = 0
+#             prev_nodes = set()
+            
+#             for time, weight in sorted(weights.items(), key=lambda x: x[0]):
+#                 temp_nodes = nx.single_source_dijkstra_path_length(
+#                     network, supply_nearest_nodes, cutoff=time, weight='time'
+#                 ).keys()
+                
+#                 current_nodes = set(temp_nodes) - prev_nodes
+#                 demand_sum = demand.loc[
+#                     demand['nearest_osm'].isin(current_nodes), demand_attr
+#                 ].sum() * weight
+                
+#                 total_demand += demand_sum
+#                 prev_nodes.update(temp_nodes)
+            
+#             if total_demand > 0:
+#                 supply_value = supply_.loc[i, supply_attr]
+#                 supply_.loc[i, 'ratio'] = (supply_value / total_demand) * 100000
+#             else:
+#                 supply_.loc[i, 'ratio'] = 0
+
+#     return supply_
+
 def step1_E2SFCA_alternative(
     weights: Dict[Union[float, int], Union[float, int]],
     supply: gpd.GeoDataFrame,
@@ -399,67 +592,96 @@ def step1_E2SFCA_alternative(
     network: nx.MultiDiGraph
 ) -> gpd.GeoDataFrame:
     """
-    대체 1단계: 모든 격자 캐치먼트의 합집합 기반 수요 계산
+    개선된 1단계: 공원(parent_id) 단위 캐치먼트 통합 계산
     """
     supply_ = supply.copy(deep=True)
     supply_['ratio'] = 0
 
-    for i in tqdm(range(supply_.shape[0])):
-        supply_nearest_nodes = supply_.loc[i, 'nearest_osm']
+    # 공원별 그룹화
+    for parent_id, group in tqdm(supply_.groupby('parent_id'), desc="Processing parks"):
+        all_demand_nodes = set()
         
-        if isinstance(supply_nearest_nodes, list):
-            # 모든 격자 캐치먼트의 합집합 계산
-            all_demand_nodes = set()
-            for supply_node in supply_nearest_nodes:
-                prev_nodes = set()
-                total_grid_demand = 0
-                
-                # 시간 계층별 누적 노드 수집
-                for time, _ in sorted(weights.items(), key=lambda x: x[0]):
-                    temp_nodes = nx.single_source_dijkstra_path_length(
-                        network, supply_node, cutoff=time, weight='time'
+        # 모든 격자 노드의 캐치먼트 통합
+        for idx, row in group.iterrows():
+            nodes = row['nearest_osm']
+            if isinstance(nodes, list):
+                for node in nodes:
+                    prev = set()
+                    for time, _ in sorted(weights.items()):
+                        temp = nx.single_source_dijkstra_path_length(
+                            network, node, cutoff=time, weight='time'
+                        ).keys()
+                        all_demand_nodes.update(set(temp) - prev)
+                        prev.update(temp)
+            else:
+                prev = set()
+                for time, _ in sorted(weights.items()):
+                    temp = nx.single_source_dijkstra_path_length(
+                        network, nodes, cutoff=time, weight='time'
                     ).keys()
-                    current_nodes = set(temp_nodes) - prev_nodes
-                    all_demand_nodes.update(current_nodes)
-                    prev_nodes.update(temp_nodes)
-            
-            # 고유 수요 노드 기반 총 수요량 계산
-            total_demand = demand.loc[
-                demand['nearest_osm'].isin(all_demand_nodes), demand_attr
-            ].sum()
-            
-            # 공급 비율 계산
-            if total_demand > 0:
-                supply_value = supply_.loc[i, supply_attr]
-                supply_.loc[i, 'ratio'] = (supply_value / total_demand) * 100000
-            else:
-                supply_.loc[i, 'ratio'] = 0
-                
-        else:
-            # 점형 시설은 기존 로직 유지
-            total_demand = 0
-            prev_nodes = set()
-            
-            for time, weight in sorted(weights.items(), key=lambda x: x[0]):
-                temp_nodes = nx.single_source_dijkstra_path_length(
-                    network, supply_nearest_nodes, cutoff=time, weight='time'
-                ).keys()
-                
-                current_nodes = set(temp_nodes) - prev_nodes
-                demand_sum = demand.loc[
-                    demand['nearest_osm'].isin(current_nodes), demand_attr
-                ].sum() * weight
-                
-                total_demand += demand_sum
-                prev_nodes.update(temp_nodes)
-            
-            if total_demand > 0:
-                supply_value = supply_.loc[i, supply_attr]
-                supply_.loc[i, 'ratio'] = (supply_value / total_demand) * 100000
-            else:
-                supply_.loc[i, 'ratio'] = 0
+                    all_demand_nodes.update(set(temp) - prev)
+                    prev.update(temp)
+
+        # 고유 수요 계산
+        total_demand = demand.loc[
+            demand['nearest_osm'].isin(all_demand_nodes), demand_attr
+        ].sum()
+
+        # 비율 계산 및 할당
+        ratio = (group[supply_attr].iloc[0] / total_demand * 100000) if total_demand > 0 else 0
+        supply_.loc[group.index, 'ratio'] = ratio
 
     return supply_
+
+
+# def step2_E2SFCA_alternative(
+#     weights: Dict[Union[float, int], Union[float, int]],
+#     result_step1: pd.DataFrame,
+#     demand: pd.DataFrame,
+#     network: nx.Graph
+# ) -> pd.DataFrame:
+#     """
+#     대체 2단계: 단일 격자 포함 시 전체 공급량 반영
+#     """
+#     demand_ = demand.copy(deep=True)
+#     demand_['access'] = 0
+    
+#     for z in tqdm(range(demand_.shape[0]), desc="Processing demand points"):
+#         total_sum = 0
+#         prev_nodes = set()
+        
+#         for time, weight in sorted(weights.items(), key=lambda x: x[0]):
+#             temp_nodes = nx.single_source_dijkstra_path_length(
+#                 network,
+#                 source=demand_.loc[z, 'nearest_osm'],
+#                 cutoff=time,
+#                 weight='time'
+#             ).keys()
+            
+#             current_nodes = set(temp_nodes) - prev_nodes
+            
+#             # 공급시설 접근성 계산
+#             for idx, supply_row in result_step1.iterrows():
+#                 supply_nearest_nodes = supply_row['nearest_osm']
+#                 supply_ratio = supply_row['ratio']
+                
+#                 if supply_ratio == 0:
+#                     continue
+                    
+#                 # 폴리곤 시설: 단일 격자 포함 여부 확인
+#                 if isinstance(supply_nearest_nodes, list):
+#                     if any(node in current_nodes for node in supply_nearest_nodes):
+#                         total_sum += supply_ratio * weight
+#                 # 점형 시설: 기존 로직
+#                 else:
+#                     if supply_nearest_nodes in current_nodes:
+#                         total_sum += supply_ratio * weight
+            
+#             prev_nodes.update(temp_nodes)
+        
+#         demand_.loc[z, 'access'] = total_sum
+
+#     return demand_
 
 def step2_E2SFCA_alternative(
     weights: Dict[Union[float, int], Union[float, int]],
@@ -468,47 +690,37 @@ def step2_E2SFCA_alternative(
     network: nx.Graph
 ) -> pd.DataFrame:
     """
-    대체 2단계: 단일 격자 포함 시 전체 공급량 반영
+    개선된 2단계: 공원 단위 중복 제거 계산
     """
-    demand_ = demand.copy(deep=True)
+    # 공원별 데이터 사전 생성
+    park_data = result_step1.groupby('parent_id').agg({
+        'ratio': 'first',
+        'nearest_osm': lambda x: list(set([n for lst in x for n in lst]))
+    }).to_dict('index')
+
+    demand_ = demand.copy()
     demand_['access'] = 0
-    
-    for z in tqdm(range(demand_.shape[0]), desc="Processing demand points"):
-        total_sum = 0
-        prev_nodes = set()
+
+    for z in tqdm(range(demand_.shape[0]), desc="Demand points"):
+        total = 0
+        prev = set()
         
-        for time, weight in sorted(weights.items(), key=lambda x: x[0]):
-            temp_nodes = nx.single_source_dijkstra_path_length(
-                network,
-                source=demand_.loc[z, 'nearest_osm'],
-                cutoff=time,
-                weight='time'
-            ).keys()
+        for time, weight in sorted(weights.items()):
+            current = set(nx.single_source_dijkstra_path_length(
+                network, demand_.loc[z, 'nearest_osm'], cutoff=time, weight='time'
+            ).keys()) - prev
             
-            current_nodes = set(temp_nodes) - prev_nodes
+            # 공원별 접근성 확인
+            for park_id, data in park_data.items():
+                if any(node in current for node in data['nearest_osm']):
+                    total += data['ratio'] * weight
             
-            # 공급시설 접근성 계산
-            for idx, supply_row in result_step1.iterrows():
-                supply_nearest_nodes = supply_row['nearest_osm']
-                supply_ratio = supply_row['ratio']
-                
-                if supply_ratio == 0:
-                    continue
-                    
-                # 폴리곤 시설: 단일 격자 포함 여부 확인
-                if isinstance(supply_nearest_nodes, list):
-                    if any(node in current_nodes for node in supply_nearest_nodes):
-                        total_sum += supply_ratio * weight
-                # 점형 시설: 기존 로직
-                else:
-                    if supply_nearest_nodes in current_nodes:
-                        total_sum += supply_ratio * weight
-            
-            prev_nodes.update(temp_nodes)
+            prev.update(current)
         
-        demand_.loc[z, 'access'] = total_sum
+        demand_.loc[z, 'access'] = total
 
     return demand_
+
 
 ################## 성능 최적화 방안 ##########################
 
@@ -555,4 +767,3 @@ def process_rwi_to_grid(
     # 5. 저장
     result.to_file(output_path, driver="GeoJSON")
     print(f"✅ 처리 완료: {output_path}")
-
