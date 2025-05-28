@@ -330,39 +330,35 @@ def explode_grids(gdf, grid_size):
             
 #     return gdf
 def nearest_osm_enhanced(network, gdf, grid_size=200):
+    # 1. 필수 컬럼 검증
+    required_columns = ['geometry', 'Area_grid', 'Area_total']
+    assert all(col in gdf.columns for col in required_columns), "필수 컬럼 누락"
+    
     gdf = gdf.copy()
     
-    # 1단계: object 타입 초기화 (강제)
-    gdf['nearest_osm'] = gdf['nearest_osm'].astype('object')
+    # 2. 폴리곤 → 포인트 강제 변환
+    gdf['geometry'] = gdf.geometry.apply(
+        lambda geom: geom.centroid if geom.geom_type != 'Point' else geom
+    )
     
-    # 2단계: 빈 리스트로 초기화
-    gdf['nearest_osm'] = [[] for _ in range(len(gdf))]
+    # 3. nearest_osm 컬럼 초기화 (리스트 대신 정수)
+    gdf['nearest_osm'] = None
     
+    # 4. 노드 매핑
     for idx, row in tqdm(gdf.iterrows(), total=len(gdf)):
-        geom = row.geometry
-        
         try:
-            if geom.geom_type == 'Point':
-                nearest_node = ox.distance.nearest_nodes(network, geom.x, geom.y)
-                gdf.at[idx, 'nearest_osm'] = [nearest_node]  # 리스트 할당
-                
-            elif geom.geom_type in ['Polygon', 'MultiPolygon']:
-                if geom.geom_type == 'MultiPolygon':
-                    geom = max(geom.geoms, key=lambda p: p.area)
-                grid_centroids = create_polygon_grid(geom, grid_size)
-                nearest_nodes = [
-                    ox.distance.nearest_nodes(network, pt.x, pt.y)
-                    for pt in grid_centroids
-                ]
-                gdf.at[idx, 'nearest_osm'] = nearest_nodes  # 리스트 할당
-                
+            nearest_node = ox.distance.nearest_nodes(
+                network, 
+                row.geometry.x, 
+                row.geometry.y
+            )
+            gdf.at[idx, 'nearest_osm'] = int(nearest_node)
         except Exception as e:
-            gdf.at[idx, 'nearest_osm'] = []  # 빈 리스트 유지
-            
-    # 3단계: 최종 타입 강제 지정
-    gdf['nearest_osm'] = gdf['nearest_osm'].astype('object')
+            print(f"Error at {idx}: {e}")
+            gdf.at[idx, 'nearest_osm'] = None
     
-    return gdf
+    # 5. 원본 컬럼 보존
+    return gdf[required_columns + ['nearest_osm']]
 
 
 
@@ -767,3 +763,86 @@ def process_rwi_to_grid(
     # 5. 저장
     result.to_file(output_path, driver="GeoJSON")
     print(f"✅ 처리 완료: {output_path}")
+
+###### 데이터 결과 검증 #########
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from esda.moran import Moran, Moran_Local
+from splot.esda import moran_scatterplot, plot_moran, lisa_cluster
+from scipy.stats import ks_2samp
+
+# # 1. 데이터 준비 (가정)
+# grid_access = gpd.read_file('grid_access_results.geojson')  # 그리드 기반 결과
+# centroid_access = gpd.read_file('centroid_access_results.geojson')  # 중심점 기반 결과
+
+# # 2. 공간 가중치 생성 (퀸 contiguity 기준)
+# w = Queen.from_dataframe(grid_access)  # 그리드 결과 기준 가중치
+# w.transform = 'r'  # 행 표준화
+
+# # 3. Global Moran's I 계산
+# def calculate_moran(access_data, w):
+#     moran = Moran(access_data['access'].values, w)
+#     print(f"Moran's I: {moran.I:.3f}")
+#     print(f"P-value: {moran.p_sim:.5f}")
+    
+#     # Moran 플롯
+#     fig, ax = moran_scatterplot(moran, aspect_equal=True)
+#     plt.show()
+#     return moran
+
+# print("그리드 기반 Moran's I:")
+# moran_grid = calculate_moran(grid_access, w)
+
+# print("\n중심점 기반 Moran's I:")
+# moran_centroid = calculate_moran(centroid_access, w)
+
+# # 4. LISA 분석
+# def calculate_lisa(access_data, w):
+#     moran_loc = Moran_Local(access_data['access'].values, w)
+    
+#     # LISA 클러스터 맵
+#     fig, ax = lisa_cluster(moran_loc, access_data)
+#     plt.show()
+#     return moran_loc
+
+# print("\n그리드 기반 LISA 분석:")
+# lisa_grid = calculate_lisa(grid_access, w)
+
+# print("\n중심점 기반 LISA 분석:")
+# lisa_centroid = calculate_lisa(centroid_access, w)
+
+# # 5. Gini 계수 계산 (검색결과[3] 참조)
+# def gini(array):
+#     array = array.flatten()
+#     array += 1e-10  # 0 값 방지
+#     array = np.sort(array)
+#     n = len(array)
+#     index = np.arange(1, n+1)
+#     return (np.sum((2 * index - n - 1) * array)) / (n * np.sum(array))
+
+# gini_grid = gini(grid_access['access'].values)
+# gini_centroid = gini(centroid_access['access'].values)
+# print(f"\nGini 계수 - 그리드: {gini_grid:.3f}, 중심점: {gini_centroid:.3f}")
+
+# # 6. Kolmogorov-Smirnov 검정
+# ks_stat, ks_p = ks_2samp(grid_access['access'], centroid_access['access'])
+# print(f"\nKS 검정 결과: 통계량={ks_stat:.3f}, p-value={ks_p:.5f}")
+
+# # 7. 결과 시각화
+# fig, ax = plt.subplots(1,2, figsize=(15,6))
+
+# # Moran's I 비교
+# ax[0].bar(['Grid', 'Centroid'], 
+#           [moran_grid.I, moran_centroid.I],
+#           color=['blue', 'orange'])
+# ax[0].set_title("Global Moran's I 비교")
+
+# # Gini 계수 비교
+# ax[1].bar(['Grid', 'Centroid'],
+#           [gini_grid, gini_centroid],
+#           color=['blue', 'orange'])
+# ax[1].set_title("Gini 계수 비교")
+
+# plt.show()
